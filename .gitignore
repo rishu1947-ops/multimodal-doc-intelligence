@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+chroma_db/
+bm25_indexes/
+uploads/
+venv/
+env/
+multimodal_doc_intelligence_env/__pycache__/
+*.pyc
+.env
+chroma_db/
+bm25_indexes/
+uploads/
+venv/
+env/
+multimodal_doc_intelligence_env/

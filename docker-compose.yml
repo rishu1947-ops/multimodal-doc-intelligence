@@ -1,0 +1,20 @@
+services:
+  app:
+    build: .
+    container_name: doc-intelligence-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./bm25_indexes:/app/bm25_indexes
+      - ./uploads:/app/uploads
+      # If you need to test code changes during development, mount app/ read-write:
+      # - ./app:/app/app
+    environment:
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

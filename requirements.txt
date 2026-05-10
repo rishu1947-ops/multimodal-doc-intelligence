@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pymupdf
+pdf2image
+pillow
+pydantic
+langchain-text-splitters
+sentence-transformers
+chromadb
+rank-bm25
+ollama
+python-multipart
+python-dotenv
+langfuse>=2.60.0,<3.0.0

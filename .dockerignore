@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+.venv
+venv
+env
+.env
+chroma_db
+bm25_indexes
+uploads
+*.log
+.DS_Store
+tests
