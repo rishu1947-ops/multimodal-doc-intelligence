@@ -6,20 +6,25 @@ import time
 from typing import Dict, List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+import traceback
+from fastapi import Request
+from fastapi.responses import PlainTextResponse
+from fastapi import Form
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Import your pipeline modules
 from app.ingestion.classifier import classify_pdf
-from app.ingestion.extractor import extract_text_native_pdf  # for text-native
+from app.ingestion.extractor import extract_text_native_pdf, extract_scanned_pdf, extract_scanned_image
 from app.indexing.chunker import chunk_document
 from app.indexing.chroma_store import ChromaStore
 from app.indexing.bm25_store import BM25Store
 from app.retrieval.hybrid_retriever import HybridRetriever
 from app.generation.generator import generate_answer
-from app.orchestration.graph import build_graph  # optional, if you want to use the full graph
 from app.evaluation.ragas_eval import compute_ragas_scores
 from app.evaluation.llm_judge import llm_as_judge
+from app.ingestion.extractor import describe_query_image
 from app.observability.langfuse_client import langfuse, flush
-from app.ingestion.extractor import extract_scanned_image
 
 app = FastAPI(title="Multimodal Document Intelligence API")
 
@@ -30,29 +35,32 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 documents_store = {}       # doc_id -> metadata
 query_logs = {}            # doc_id -> list of query records
 
+# Shared pool for RAGAS / LLM-judge so blocking eval code does not stall the event loop
+executor = ThreadPoolExecutor(max_workers=4)
+
 # ------------------------------------------------------------------
 # Helper: process a document (ingestion)
 # ------------------------------------------------------------------
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
+PDF_EXTENSIONS = {'.pdf'}
+
 def process_document(file_path: str, doc_id: str) -> dict:
     start_time = time.time()
     file_ext = os.path.splitext(file_path)[1].lower()
 
-    # Handle image files directly
-    if file_ext in ['.png', '.jpg', '.jpeg']:
+    # Route based on file type
+    if file_ext in IMAGE_EXTENSIONS:
+        # Single image → treat as one-page scanned document
         extracted_doc = extract_scanned_image(file_path, doc_id)
-        doc_type = "scanned"
+    elif file_ext in PDF_EXTENSIONS:
+        # PDF: classify as text-native or scanned
+        doc_type, _ = classify_pdf(file_path)
+        if doc_type == "text_native":
+            extracted_doc = extract_text_native_pdf(file_path, doc_id)
+        else:
+            extracted_doc = extract_scanned_pdf(file_path, doc_id)
     else:
-        # Assume PDF
-        doc_type, page_texts = classify_pdf(file_path)
-
-    # 1. Classify
-    doc_type, page_texts = classify_pdf(file_path)
-    
-    # 2. Extract (only text-native for now; add scanned later)
-    if doc_type == "text_native":
-        extracted_doc = extract_text_native_pdf(file_path, doc_id)
-    else:
-        extracted_doc = extract_scanned_pdf(file_path, doc_id)
+        raise ValueError(f"Unsupported file type: {file_ext}. Supported: PDF, PNG, JPG, JPEG, WEBP, BMP, TIFF")
     
     # 3. Chunk
     chunks = chunk_document(extracted_doc, similarity_threshold=0.3, min_chunk_sentences=2, min_chunk_chars=100)
@@ -99,9 +107,17 @@ class QueryResponse(BaseModel):
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
+
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    # Save uploaded file
+    # Validate file type up front
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{file_ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
     file_ext = os.path.splitext(file.filename)[1]
     doc_id = str(uuid.uuid4())
     save_path = os.path.join(UPLOAD_DIR, f"{doc_id}{file_ext}")
@@ -119,41 +135,76 @@ async def upload_document(file: UploadFile = File(...)):
     
     return metadata
 
-from app.observability.langfuse_client import langfuse, flush
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return PlainTextResponse(
+        f"ERROR: {type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
+        status_code=500
+    )
 
 @app.post("/query")
-async def query_document(req: QueryRequest):
-    if req.document_id not in documents_store:
+async def query_document(
+    document_id: str = Form(...),
+    query: str = Form(...),
+    top_k: int = Form(3),
+    image: UploadFile = File(None),
+    run_llm_judge: bool = Form(False)
+):
+    if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
 
     start_time = time.time()
 
+    # If image provided, extract description and augment query
+    image_context = None
+    augmented_query = query
+
+    if image is not None:
+        img_ext = os.path.splitext(image.filename)[1]
+        img_path = os.path.join(UPLOAD_DIR, f"query_{uuid.uuid4()}{img_ext}")
+        with open(img_path, "wb") as f:
+            shutil.copyfileobj(image.file, f)
+        try:
+            image_context = describe_query_image(img_path)
+            augmented_query = f"{query}\n\nImage context: {image_context}"
+        finally:
+            os.remove(img_path)
+
     # --- Langfuse tracing (v2) ---
     trace = langfuse.trace(
         name="query_document",
-        metadata={"document_id": req.document_id, "query": req.query}
+        metadata={"document_id": document_id, "query": query}  
     )
 
     # Retrieve
     retrieve_span = trace.span(name="retrieve")
     retriever = HybridRetriever()
-    chunks = retriever.retrieve(req.document_id, req.query, top_k=req.top_k)
+    chunks = retriever.retrieve(document_id, augmented_query, top_k=top_k)
     retrieve_span.update(output={"num_chunks": len(chunks)})
     retrieve_span.end()
 
     # Generate
     generate_span = trace.span(name="generate")
-    gen_result = generate_answer(req.query, chunks, model="qwen3:8b")
+    gen_result = generate_answer(query, chunks, model="qwen3:8b", image_context=image_context)  
     answer = gen_result["answer"]
-    raw_citations = gen_result["citations"]  # should be list of dicts like [{"page_number": 1}]
+    raw_citations = gen_result["citations"]
     generate_span.update(output={"answer_length": len(answer), "num_citations": len(raw_citations)})
     generate_span.end()
 
-    # Evaluate
+   # Evaluate
     evaluate_span = trace.span(name="evaluate")
     contexts = [ch["text"] for ch in chunks]
-    ragas = compute_ragas_scores(req.query, answer, contexts)
-    judge_score = llm_as_judge(req.query, answer, contexts)
+
+    loop = asyncio.get_running_loop()
+    ragas_future = loop.run_in_executor(executor, compute_ragas_scores, query, answer, contexts)
+    judge_future = loop.run_in_executor(executor, llm_as_judge, query, answer, contexts) if run_llm_judge else None
+
+    if judge_future:
+        ragas, judge_score = await asyncio.gather(ragas_future, judge_future)
+    else:
+        ragas = await ragas_future
+        judge_score = None
+
     eval_scores = {
         "faithfulness": ragas["faithfulness"],
         "answer_relevance": ragas["answer_relevancy"],
@@ -174,34 +225,29 @@ async def query_document(req: QueryRequest):
     latency_ms = int((time.time() - start_time) * 1000)
 
     # --- Store logs ---
-    query_logs[req.document_id].append({
-        "query": req.query,
+    query_logs[document_id].append({       
+        "query": query,                    
         "answer": answer,
         "eval_scores": eval_scores,
         "latency_ms": latency_ms
     })
 
-    
     clean_citations = []
     for item in raw_citations:
         if isinstance(item, dict) and "page_number" in item:
             clean_citations.append({"page_number": item["page_number"]})
-        # If it's a number directly, convert it
         elif isinstance(item, int):
             clean_citations.append({"page_number": item})
-        # Ignore any other type (like eval_scores dicts)
-    # If clean_citations is empty but raw_citations had something, try to extract page numbers from answer text
     if not clean_citations and raw_citations:
         import re
         found = re.findall(r'\([Pp]age (\d+)\)', answer)
         clean_citations = [{"page_number": int(p)} for p in set(found)]
 
-    # --- FINAL RETURN: Separate top-level fields, no merging ---
     return {
         "answer": answer,
-        "citations": clean_citations,      # list of page dicts only
-        "eval_scores": eval_scores,        # separate field
-        "latency_ms": latency_ms           # separate field
+        "citations": clean_citations,
+        "eval_scores": eval_scores,
+        "latency_ms": latency_ms
     }
 
 @app.get("/eval/summary/{document_id}")

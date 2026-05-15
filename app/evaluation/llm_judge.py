@@ -3,7 +3,7 @@ import ollama
 import re
 from typing import List, Dict
 
-def llm_as_judge(question: str, answer: str, contexts: List[str], model: str = "qwen3:8b") -> float:
+def llm_as_judge(question: str, answer: str, contexts: List[str], model: str = "llama3.2:latest") -> float:
     """
     Asks an LLM to rate factual grounding from 1 to 5.
     Returns a float score (1 to 5).
@@ -28,6 +28,8 @@ Score:"""
     
     response = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
     raw = response["message"]["content"].strip()
+    # Strip <think>...</think> blocks emitted by Qwen3 before parsing the score
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
     # Extract first number
     match = re.search(r'\d+(?:\.\d+)?', raw)
     if match:

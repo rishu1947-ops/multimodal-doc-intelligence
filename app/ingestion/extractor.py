@@ -1,4 +1,5 @@
 # app/ingestion/extractor.py
+import re
 import fitz
 from typing import List, Optional
 from app.ingestion.schemas import DocumentPage, ExtractedDocument, KeyEntities
@@ -17,7 +18,7 @@ def extract_scanned_image(image_path: str, document_id: str) -> ExtractedDocumen
     if img.mode != 'RGB':
         img = img.convert('RGB')
     img_base64 = encode_image(img)
-    raw = call_qwen2_vl(img_base64)
+    raw = call_vision_llm(img_base64)
     doc_page = parse_vision_response(1, raw)  # page number 1
     return ExtractedDocument(
         document_id=document_id,
@@ -62,32 +63,42 @@ def encode_image(image: Image.Image) -> str:
     image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-VISION_EXTRACTION_PROMPT = """You are a document parser. Extract ALL content from this page image.
-Return a JSON object with these exact fields:
-{
-  "page_text": "full extracted text, including any handwritten or printed content",
-  "tables": [{"headers": [], "rows": [[]]}],
-  "key_entities": {"dates": [], "amounts": [], "names": [], "identifiers": []}
-}
-If there are no tables, return an empty list. If no entities of a certain type, return an empty list.
-Return ONLY the JSON. No preamble, no markdown."""
 
-def call_qwen2_vl(image_base64: str) -> str:
+def call_vision_llm(image_base64: str, page_num: int) -> str:
     response = ollama.chat(
-        model="qwen2.5vl:7b-q8_0",   # ← exact tag from your list
+        model="moondream",
         messages=[{
             "role": "user",
-            "content": VISION_EXTRACTION_PROMPT,
+            "content": "Extract all text, tables, and key data from this document page. Return as JSON: {page_text, tables, key_entities}",
             "images": [image_base64]
-        }]
+        }],
+        options={"num_predict": 512}  # add this
     )
     return response["message"]["content"]
 
 def parse_vision_response(page_num: int, response_text: str) -> DocumentPage:
+    # Strip markdown code fences if the model wrapped the JSON
+    text = response_text.strip()
+    if text.startswith("```"):
+        # Remove opening fence (```json or ```)
+        text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+        # Remove closing fence
+        text = re.sub(r'\n?```$', '', text.strip())
+        text = text.strip()
+
     try:
-        data = json.loads(response_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON for page {page_num}: {response_text[:200]}") from e
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Last-ditch: try to find a JSON object inside the text
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Could not parse JSON for page {page_num}: {text[:300]}") from e
+        else:
+            raise ValueError(f"No JSON found in vision response for page {page_num}: {text[:300]}")
+
     tables = [ExtractedTable(**t) for t in data.get("tables", [])]
     entities = KeyEntities(**data.get("key_entities", {}))
     return DocumentPage(
@@ -104,7 +115,7 @@ def extract_scanned_pdf(pdf_path: str, document_id: str, dpi: int = 150) -> Extr
         page_num = idx + 1
         try:
             img_base64 = encode_image(img)
-            raw = call_qwen2_vl(img_base64)
+            raw = call_vision_llm(img_base64)
             doc_page = parse_vision_response(page_num, raw)
             pages.append(doc_page)
         except Exception as e:
@@ -121,3 +132,16 @@ def extract_scanned_pdf(pdf_path: str, document_id: str, dpi: int = 150) -> Extr
         pages=pages,
         source_type="scanned"
     )
+
+def describe_query_image(image_path: str) -> str:
+    ...
+    response = ollama.chat(
+        model="moondream",
+        messages=[{
+            "role": "user",
+            "content": "Describe the key content in this image briefly.",  # shorter prompt too
+            "images": [img_base64]
+        }],
+        options={"num_predict": 256}  # even shorter for query images
+    )
+    return response["message"]["content"]
