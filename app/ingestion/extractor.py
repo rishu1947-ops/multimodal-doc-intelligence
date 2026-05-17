@@ -12,14 +12,17 @@ import ollama
 from app.ingestion.schemas import ExtractedDocument, DocumentPage, ExtractedTable, KeyEntities
 
 def extract_scanned_image(image_path: str, document_id: str) -> ExtractedDocument:
-    """Process a single image file (PNG, JPG) as a scanned document."""
     img = Image.open(image_path)
-    # Convert to RGB if needed
     if img.mode != 'RGB':
         img = img.convert('RGB')
     img_base64 = encode_image(img)
-    raw = call_vision_llm(img_base64)
-    doc_page = parse_vision_response(1, raw)  # page number 1
+    page_text = call_vision_llm(img_base64, page_num=1)
+    doc_page = DocumentPage(
+        page_number=1,
+        page_text=page_text,
+        tables=[],
+        key_entities=KeyEntities()
+    )
     return ExtractedDocument(
         document_id=document_id,
         pages=[doc_page],
@@ -66,13 +69,14 @@ def encode_image(image: Image.Image) -> str:
 
 def call_vision_llm(image_base64: str, page_num: int) -> str:
     response = ollama.chat(
-        model="moondream",
+        model="moondream:latest",
         messages=[{
             "role": "user",
-            "content": "Extract all text, tables, and key data from this document page. Return as JSON: {page_text, tables, key_entities}",
+            "content": "Describe all the text, data, and content visible in this image.",
             "images": [image_base64]
         }],
-        options={"num_predict": 512}  # add this
+        options={"num_predict": 512},
+        keep_alive="1h"
     )
     return response["message"]["content"]
 
@@ -115,12 +119,16 @@ def extract_scanned_pdf(pdf_path: str, document_id: str, dpi: int = 150) -> Extr
         page_num = idx + 1
         try:
             img_base64 = encode_image(img)
-            raw = call_vision_llm(img_base64)
-            doc_page = parse_vision_response(page_num, raw)
+            page_text = call_vision_llm(img_base64, page_num=page_num)
+            doc_page = DocumentPage(
+                page_number=page_num,
+                page_text=page_text,
+                tables=[],
+                key_entities=KeyEntities()
+            )
             pages.append(doc_page)
         except Exception as e:
             print(f"Page {page_num} failed: {e}")
-            # Append an error placeholder so ingestion continues
             pages.append(DocumentPage(
                 page_number=page_num,
                 page_text=f"[Error extracting page {page_num}: {e}]",
@@ -134,14 +142,17 @@ def extract_scanned_pdf(pdf_path: str, document_id: str, dpi: int = 150) -> Extr
     )
 
 def describe_query_image(image_path: str) -> str:
-    ...
+    img = Image.open(image_path)        # fix: actually load the image
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    img_base64 = encode_image(img)      # fix: encode it before using
     response = ollama.chat(
-        model="moondream",
+        model="moondream:latest",
         messages=[{
             "role": "user",
-            "content": "Describe the key content in this image briefly.",  # shorter prompt too
+            "content": "Describe the key content in this image briefly.",
             "images": [img_base64]
         }],
-        options={"num_predict": 256}  # even shorter for query images
+        options={"num_predict": 256}
     )
     return response["message"]["content"]
